@@ -10,19 +10,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{BlockHash, Network, TestnetVersion};
+use bitcoin::{
+    block::Unchecked, consensus::encode::deserialize, secp256k1::Secp256k1, BlockHash, Network,
+    TestnetVersion,
+};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
-    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
+    core::BlockHashExt,
+    prelude::{
+        BlockSpentOutputsExt, BlockValidationStateExt, CoinExt, ScriptPubkeyExt,
+        TransactionSpentOutputsExt, TxOutExt,
+    },
+    ChainType, ChainstateManagerBuilder, Context, ContextBuilder, Log, Logger,
+    SynchronizationState, ValidationMode,
 };
 use kernel_node::{
     daemonize::Daemonize,
-    peer::{BitcoinPeer, NodeState, TipState},
-};
-use kernel_node::{
-    ipc::IpcInterface,
+    ipc::{IpcInterface, WalletIpcInterface, WalletState},
     kernel_util::{ChainExt, DirnameExt},
+    peer::{BitcoinPeer, NodeState, TipState},
     server_capnp::server,
+    silentpayments::{scan_block, InputData, OutputData, TransactionData},
+    wallet_capnp::wallet,
 };
 use log::{debug, error, info, warn};
 use p2p::{
@@ -168,6 +176,158 @@ fn resolve_seeds(network: Network) -> Vec<IpAddr> {
     results
 }
 
+struct TxScanData {
+    txid: [u8; 32],
+    prevout_scripts: Vec<Vec<u8>>,
+    script_sigs: Vec<Vec<u8>>,
+    witnesses: Vec<Vec<Vec<u8>>>,
+    outpoints: Vec<[u8; 36]>,
+    outputs: Vec<(u32, i64, Vec<u8>)>,
+}
+
+fn scan_kernel_block(
+    chainman: &bitcoinkernel::ChainstateManager,
+    kernel_block: &bitcoinkernel::Block,
+    wallet_state: &WalletState,
+) {
+    let scan_key = *wallet_state.scan_key.lock().unwrap();
+    let spend_key = *wallet_state.spend_key.lock().unwrap();
+    let (scan_key, spend_key) = match (scan_key, spend_key) {
+        (Some(s), Some(sp)) => (s, sp),
+        _ => return,
+    };
+
+    let raw = match kernel_block.consensus_encode() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to encode block for scanning: {e}");
+            return;
+        }
+    };
+    let btc_block: bitcoin::Block<Unchecked> = match deserialize(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to decode block for scanning: {e}");
+            return;
+        }
+    };
+
+    let block_hash = kernel_block.hash();
+    let entry = match chainman.get_block_tree_entry(&block_hash) {
+        Some(e) => e,
+        None => {
+            warn!("Scanned block not found in block tree");
+            return;
+        }
+    };
+    let block_height = entry.height() as u32;
+    let spent_outputs = match chainman.read_spent_outputs(&entry) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to read undo data for scanning: {e}");
+            return;
+        }
+    };
+
+    let (_, txs) = btc_block.into_parts();
+    let mut input_outpoints: Vec<([u8; 32], [u8; 32], u32)> = Vec::new();
+    let mut tx_data: Vec<TxScanData> = Vec::with_capacity(spent_outputs.count());
+
+    for (i, tx_spent) in spent_outputs.iter().enumerate() {
+        let btc_tx_idx = i + 1;
+        if btc_tx_idx >= txs.len() {
+            warn!("Undo data has more entries than block transactions");
+            break;
+        }
+        let btc_tx = &txs[btc_tx_idx];
+        let txid = btc_tx.compute_txid().to_byte_array();
+
+        let mut prevout_scripts = Vec::new();
+        let mut script_sigs = Vec::new();
+        let mut witnesses: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut outpoints = Vec::new();
+
+        for (j, coin) in tx_spent.coins().enumerate() {
+            if j >= btc_tx.inputs.len() {
+                break;
+            }
+            let inp = &btc_tx.inputs[j];
+            let prev_txid = inp.previous_output.txid.to_byte_array();
+            let prev_vout = inp.previous_output.vout;
+
+            let mut op = [0u8; 36];
+            op[..32].copy_from_slice(&prev_txid);
+            op[32..].copy_from_slice(&prev_vout.to_le_bytes());
+
+            input_outpoints.push((txid, prev_txid, prev_vout));
+            prevout_scripts.push(coin.output().script_pubkey().to_bytes().to_vec());
+            script_sigs.push(inp.script_sig.as_bytes().to_vec());
+            witnesses.push(inp.witness.iter().map(|w: &[u8]| w.to_vec()).collect());
+            outpoints.push(op);
+        }
+
+        let outputs = btc_tx
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(vout, out)| {
+                (
+                    vout as u32,
+                    out.value.to_sat() as i64,
+                    out.script_pubkey.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+
+        tx_data.push(TxScanData {
+            txid,
+            prevout_scripts,
+            script_sigs,
+            witnesses,
+            outpoints,
+            outputs,
+        });
+    }
+
+    let secp = Secp256k1::verification_only();
+    let transactions: Vec<TransactionData<'_>> = tx_data
+        .iter()
+        .map(|td| {
+            let inputs = td
+                .prevout_scripts
+                .iter()
+                .enumerate()
+                .map(|(j, prevout)| InputData {
+                    prevout_script: prevout.as_slice(),
+                    script_sig: td.script_sigs[j].as_slice(),
+                    witness: td.witnesses[j].iter().map(|w| w.as_slice()).collect(),
+                    outpoint: td.outpoints[j],
+                })
+                .collect();
+            let outputs = td
+                .outputs
+                .iter()
+                .map(|(vout, value, script)| OutputData {
+                    vout: *vout,
+                    value: *value,
+                    script_pubkey: script.as_slice(),
+                })
+                .collect();
+            TransactionData {
+                txid: td.txid,
+                inputs,
+                outputs,
+            }
+        })
+        .collect();
+
+    let payments = scan_block(&secp, &scan_key, &spend_key, &transactions);
+
+    let mut wallet = wallet_state.wallet.lock().unwrap();
+    wallet.check_for_spends(&input_outpoints, block_height);
+    wallet.process_found_payments(&payments, block_height);
+}
+
 fn run(
     network: Network,
     connect: Option<SocketAddr>,
@@ -175,6 +335,7 @@ fn run(
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<AddrV2Payload>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
+    wallet_state: WalletState,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
     match connect {
@@ -300,6 +461,8 @@ fn run(
         info!("Stopping addr processing thread.");
     });
 
+    let wallet_state_block = wallet_state.clone();
+
     let block_processing_handler = thread::spawn(move || {
         info!("Starting block processing thread.");
         let mut last_block = Instant::now();
@@ -308,7 +471,10 @@ fn run(
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
+                    let result = chainman.process_block(&block);
+                    if result.is_new_block() {
+                        scan_kernel_block(&chainman, &block, &wallet_state_block);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
@@ -406,6 +572,12 @@ fn main() {
         return;
     }
 
+    let wallet_state = WalletState::new();
+    let wallet_state_ipc = wallet_state.clone();
+
+    let sock_file = data_dir.clone() + "/node.sock";
+    let wallet_sock_file = data_dir + "/wallet.sock";
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -414,10 +586,35 @@ fn main() {
         rt.block_on(async move {
             tokio::task::LocalSet::new()
                 .run_until(async move {
-                    let sock_file = data_dir + "/node.sock";
                     let _ = std::fs::remove_file(&sock_file);
+                    let _ = std::fs::remove_file(&wallet_sock_file);
                     info!("Listening for incoming IPC requests");
-                    let unix_socket = UnixListener::bind(sock_file).unwrap();
+                    let unix_socket = UnixListener::bind(&sock_file).unwrap();
+                    let wallet_socket = UnixListener::bind(wallet_sock_file).unwrap();
+
+                    tokio::task::spawn_local(async move {
+                        loop {
+                            let Ok((stream, _)) = wallet_socket.accept().await else {
+                                return;
+                            };
+                            let (reader, writer) = stream.into_split();
+                            let buf_reader = futures::io::BufReader::new(reader.compat());
+                            let buf_writer = futures::io::BufWriter::new(writer.compat_write());
+                            let network = capnp_rpc::twoparty::VatNetwork::new(
+                                buf_reader,
+                                buf_writer,
+                                capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                                Default::default(),
+                            );
+                            let client: wallet::Client = capnp_rpc::new_client(
+                                WalletIpcInterface::new(wallet_state_ipc.clone()),
+                            );
+                            let rpc_system =
+                                capnp_rpc::RpcSystem::new(Box::new(network), Some(client.client));
+                            tokio::task::spawn_local(rpc_system);
+                        }
+                    });
+
                     loop {
                         let stream = tokio::select! {
                             unix_bind_res = unix_socket.accept() => {
@@ -450,5 +647,14 @@ fn main() {
         })
     });
 
-    run(network, connect, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    run(
+        network,
+        connect,
+        node_state,
+        shutdown_rx,
+        addr_rx,
+        block_rx,
+        wallet_state,
+    )
+    .unwrap()
 }
