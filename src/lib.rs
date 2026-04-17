@@ -5,3 +5,4 @@ pub mod peer;
 pub mod silentpayments;
 
 capnp::generated_code!(pub mod server_capnp);
+capnp::generated_code!(pub mod wallet_capnp);
