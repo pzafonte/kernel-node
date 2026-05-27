@@ -21,6 +21,7 @@ use bitcoinkernel::{
     ChainstateManagerBuilder, Context, ContextBuilder, Log, Logger, SynchronizationState,
     ValidationMode,
 };
+use kernel_node::WalletState;
 use kernel_node::{
     daemonize::Daemonize,
     ext::{ChainExt, DirnameExt, NetworkExt},
@@ -36,10 +37,11 @@ use p2p::{
     handshake::ConnectionConfig,
     net::{ConnectionExt, TimeoutParams},
 };
+use std::path::PathBuf;
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use wallet::io::FileExt;
-use wallet::silentpayments::{SilentPaymentKeysFile, Wallet};
+use wallet::silentpayments::SilentPaymentKeysFile;
 
 const TABLE_WIDTH: usize = 16;
 const TABLE_SLOT: usize = 16;
@@ -55,13 +57,12 @@ configure_me::include_config!();
 
 fn create_context(
     chain_type: ChainType,
-    shutdown_tx: mpsc::Sender<()>,
+    fatal: FatalShutdown,
     tip_state: &Arc<Mutex<TipState>>,
-    wallet: Arc<Mutex<Wallet>>,
+    wallet_state: Arc<Mutex<WalletState>>,
     chainman_holder: Arc<std::sync::OnceLock<Arc<ChainstateManager>>>,
     scan_tx: mpsc::Sender<ScanEvent>,
 ) -> Arc<Context> {
-    let fatal = FatalShutdown::new(shutdown_tx);
     let tip_state_clone = tip_state.clone();
     let scan_tx_disconnect = scan_tx.clone();
     let fatal_connected = fatal.clone();
@@ -70,7 +71,7 @@ fn create_context(
     Arc::new(ContextBuilder::new()
         .chain_type(chain_type)
         .with_block_connected_validation(move |block: bitcoinkernel::Block, entry: bitcoinkernel::BlockTreeEntry<'_>| {
-            if wallet.lock().unwrap().keys.is_none() {
+            if wallet_state.lock().unwrap().wallet.keys.is_none() {
                 return;
             }
             let Some(chainman) = chainman_holder.get() else { return };
@@ -238,7 +239,8 @@ fn run(
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
     scan_rx: mpsc::Receiver<ScanEvent>,
     broadcast_rx: mpsc::Receiver<Transaction>,
-    wallet: Arc<Mutex<Wallet>>,
+    wallet_state: Arc<Mutex<WalletState>>,
+    fatal: FatalShutdown,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
     match connect {
@@ -393,6 +395,7 @@ fn run(
         info!(target: Category::NODE, "Stopping block processing thread.");
     });
 
+    let fatal_scan = fatal.clone();
     let scan_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting scan thread.");
         while running_scan.load(Ordering::SeqCst) {
@@ -402,16 +405,27 @@ fn run(
                     block,
                     spent_outputs,
                 }) => {
-                    let count =
-                        wallet
-                            .lock()
-                            .unwrap()
-                            .scan_block(block, spent_outputs, block_height);
-                    if count > 0 {
+                    let mut wallet_state = wallet_state.lock().unwrap();
+                    let result = wallet_state
+                        .wallet
+                        .scan_block(block, spent_outputs, block_height);
+                    if let Some(store) = &mut wallet_state.store {
+                        if let Err(e) =
+                            store.apply_scan(block_height, &result.new_coins, &result.newly_spent)
+                        {
+                            fatal_scan.trigger(
+                                Category::WALLET,
+                                format!("Wallet store write failed at height {block_height}: {e}"),
+                            );
+                        }
+                    }
+                    let found = result.found;
+                    drop(wallet_state);
+                    if found > 0 {
                         info!(
                             target: Category::WALLET,
                             "Found {} silent payment(s) at height {}",
-                            count, block_height
+                            found, block_height
                         );
                     }
                 }
@@ -419,7 +433,20 @@ fn run(
                     block,
                     block_height,
                 }) => {
-                    wallet.lock().unwrap().process_disconnect(block);
+                    let new_tip = block_height.saturating_sub(1);
+                    let mut wallet_state = wallet_state.lock().unwrap();
+                    let result = wallet_state.wallet.process_disconnect(block);
+                    if let Some(store) = &mut wallet_state.store {
+                        if let Err(e) =
+                            store.apply_disconnect(new_tip, &result.removed, &result.unspent)
+                        {
+                            fatal_scan.trigger(
+                                Category::WALLET,
+                                format!("Wallet store write failed at disconnect of {block_height}: {e}"),
+                            );
+                        }
+                    }
+                    drop(wallet_state);
                     info!(target: Category::WALLET, "Disconnected block at height {}", block_height);
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -466,12 +493,14 @@ fn run(
     Ok(())
 }
 
-fn auto_import_keys(wallet: &mut Wallet, path: &str) {
+fn auto_import_keys(wallet_state: &mut WalletState, path: &str) {
     let file = SilentPaymentKeysFile::load(std::path::Path::new(path))
         .unwrap_or_else(|e| panic!("Failed to load silent payment keys from {path}: {e}"));
-    wallet
+    wallet_state
+        .wallet
         .import_keys(file.scan_key, file.spend_xonly())
         .unwrap_or_else(|e| panic!("Failed to build silent payment receiver from {path}: {e}"));
+    wallet_state.ensure_store();
     info!(
         target: Category::NODE,
         "Imported silent payment keys from {path}"
@@ -495,20 +524,24 @@ fn main() {
     let tip_state = Arc::new(Mutex::new(TipState::default()));
 
     let network = config.network.parse::<Network>().expect("invalid network");
-    let wallet = Arc::new(Mutex::new(Wallet::new(network.wallet_network())));
+    let data_dir = config.datadir.data_dir();
+    let store_path = PathBuf::from(&data_dir).join("wallet.bin");
+    let mut wallet_state = WalletState::open_or_new(network.wallet_network(), store_path);
     if let Some(path) = config.sp_keys_file.as_ref() {
-        auto_import_keys(&mut wallet.lock().unwrap(), path);
+        auto_import_keys(&mut wallet_state, path);
     }
+    let wallet_state = Arc::new(Mutex::new(wallet_state));
     let chainman_holder: Arc<std::sync::OnceLock<Arc<ChainstateManager>>> =
         Arc::new(std::sync::OnceLock::new());
 
     let (scan_tx, scan_rx) = mpsc::channel::<ScanEvent>();
 
+    let fatal = FatalShutdown::new(shutdown_tx.clone());
     let context = create_context(
         network.chain_type(),
-        shutdown_tx.clone(),
+        fatal.clone(),
         &tip_state,
-        Arc::clone(&wallet),
+        Arc::clone(&wallet_state),
         Arc::clone(&chainman_holder),
         scan_tx,
     );
@@ -560,7 +593,7 @@ fn main() {
         return;
     }
 
-    let wallet_for_ipc = Arc::clone(&wallet);
+    let wallet_state_for_ipc = Arc::clone(&wallet_state);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -585,7 +618,7 @@ fn main() {
                             }
                         };
                         debug!(target: Category::IPC, "Handling inbound IPC call");
-                        let state = Arc::clone(&wallet_for_ipc);
+                        let wallet_state = Arc::clone(&wallet_state_for_ipc);
                         let (reader, writer) = stream.into_split();
                         let buf_reader = futures::io::BufReader::new(reader.compat());
                         let buf_writer = futures::io::BufWriter::new(writer.compat_write());
@@ -598,7 +631,7 @@ fn main() {
                         let client: server::Client = capnp_rpc::new_client(IpcInterface::new(
                             ipc_shutdown.clone(),
                             broadcast_tx.clone(),
-                            state,
+                            wallet_state,
                         ));
                         let rpc_system =
                             capnp_rpc::RpcSystem::new(Box::new(network), Some(client.client));
@@ -618,7 +651,8 @@ fn main() {
         block_rx,
         scan_rx,
         broadcast_rx,
-        wallet,
+        wallet_state,
+        fatal,
     )
     .unwrap();
 }

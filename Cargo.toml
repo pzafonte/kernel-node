@@ -32,6 +32,9 @@ libc = "0.2"
 capnpc = "0.25"
 configure_me_codegen = "0.4.0"
 
+[dev-dependencies]
+tempfile = "3"
+
 [package.metadata.configure_me]
 spec = "config_spec.toml"
 

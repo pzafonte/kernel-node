@@ -7,7 +7,9 @@ pub use ::silentpayments::receiving::{Label, Receiver};
 pub use ::silentpayments::{Network, SilentPaymentAddress};
 pub use keys_file::{SilentPaymentKeysFile, SpendKey};
 pub use scanning::{scan_transaction, InputData};
-pub use wallet::{Coin, HistoryEntry, SilentPaymentKeys, SpentBy, Wallet};
+pub use wallet::{
+    BlockScanResult, Coin, DisconnectResult, HistoryEntry, SilentPaymentKeys, SpentBy, Wallet,
+};
 pub use wallet_store::{WalletStore, WalletStoreError};
 
 use bitcoin::secp256k1::{self, PublicKey, SecretKey};

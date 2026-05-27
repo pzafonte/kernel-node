@@ -32,6 +32,20 @@ pub struct Coin {
     pub spent_by: Option<SpentBy>,
 }
 
+#[derive(Debug, Default)]
+pub struct BlockScanResult {
+    pub found: usize,
+    pub new_coins: Vec<(OutPoint, Coin)>,
+    pub newly_spent: Vec<(OutPoint, SpentBy)>,
+    pub scan_height: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct DisconnectResult {
+    pub removed: Vec<OutPoint>,
+    pub unspent: Vec<OutPoint>,
+}
+
 pub enum HistoryEntry {
     Received {
         outpoint: OutPoint,
@@ -113,26 +127,32 @@ impl Wallet {
         kernel_block: bitcoinkernel::Block,
         spent_outputs: bitcoinkernel::BlockSpentOutputs,
         block_height: u32,
-    ) -> usize {
+    ) -> BlockScanResult {
         let Some(keys) = self.keys.as_ref() else {
-            return 0;
+            return BlockScanResult {
+                found: 0,
+                new_coins: Vec::new(),
+                newly_spent: Vec::new(),
+                scan_height: block_height,
+            };
         };
         let receiver = keys.receiver.clone();
         let scan_key = keys.scan_key;
 
-        let found = scan_block_inner(
+        let new_coins = scan_block_inner(
             &receiver,
             &scan_key,
             &kernel_block,
             spent_outputs,
             block_height,
         );
-        let count = found.len();
+        let found = new_coins.len();
 
-        for (outpoint, coin) in found {
-            self.utxos.insert(outpoint, coin);
+        for (outpoint, coin) in &new_coins {
+            self.utxos.insert(*outpoint, coin.clone());
         }
 
+        let mut newly_spent = Vec::new();
         for kernel_tx in kernel_block.transactions() {
             let spending_txid = Txid::from_byte_array(kernel_tx.txid().to_bytes());
             for input in kernel_tx.inputs() {
@@ -142,34 +162,57 @@ impl Wallet {
                     vout: kop.index(),
                 };
                 if let Some(utxo) = self.utxos.get_mut(&prev) {
-                    utxo.spent_by = Some(SpentBy {
+                    let spent_by = SpentBy {
                         txid: spending_txid,
                         block_height,
-                    });
+                    };
+                    utxo.spent_by = Some(spent_by.clone());
+                    newly_spent.push((prev, spent_by));
                 }
             }
         }
 
         self.scan_height = block_height;
-        count
+        BlockScanResult {
+            found,
+            new_coins,
+            newly_spent,
+            scan_height: block_height,
+        }
     }
 
-    pub fn process_disconnect(&mut self, kernel_block: bitcoinkernel::Block) {
+    pub fn process_disconnect(&mut self, kernel_block: bitcoinkernel::Block) -> DisconnectResult {
         let block_txids: HashSet<Txid> = kernel_block
             .transactions()
             .map(|tx| Txid::from_byte_array(tx.txid().to_bytes()))
             .collect();
 
-        self.utxos
-            .retain(|outpoint, _| !block_txids.contains(&outpoint.txid));
+        let mut removed = Vec::new();
+        self.utxos.retain(|outpoint, _| {
+            if block_txids.contains(&outpoint.txid) {
+                removed.push(*outpoint);
+                false
+            } else {
+                true
+            }
+        });
 
-        for utxo in self.utxos.values_mut() {
+        let mut unspent = Vec::new();
+        for (outpoint, utxo) in self.utxos.iter_mut() {
             if let Some(ref s) = utxo.spent_by {
                 if block_txids.contains(&s.txid) {
                     utxo.spent_by = None;
+                    unspent.push(*outpoint);
                 }
             }
         }
+
+        DisconnectResult { removed, unspent }
+    }
+
+    pub fn restore(&mut self, scan_height: u32, coins: impl IntoIterator<Item = (OutPoint, Coin)>) {
+        self.scan_height = scan_height;
+        self.utxos.extend(coins);
     }
 
     pub fn utxo_count(&self) -> usize {
