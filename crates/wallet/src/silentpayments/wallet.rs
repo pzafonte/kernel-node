@@ -8,7 +8,7 @@ use bitcoin::{hashes::Hash, Amount, OutPoint, ScriptBuf, Txid};
 use bitcoinkernel::prelude::{TransactionExt, TxInExt, TxOutPointExt, TxidExt};
 
 use crate::silentpayments::scanning::scan_block_inner;
-use crate::silentpayments::{build_receiver, Label, Network, Receiver};
+use crate::silentpayments::{build_receiver, Network, Receiver};
 
 #[derive(Debug)]
 pub struct SilentPaymentKeys {
@@ -27,7 +27,7 @@ pub struct Coin {
     pub value: Amount,
     pub script_pubkey: ScriptBuf,
     pub tweak: Scalar,
-    pub label: Option<Label>,
+    pub label: Option<Scalar>,
     pub block_height: u32,
     pub spent_by: Option<SpentBy>,
 }

@@ -141,7 +141,7 @@ pub(crate) fn scan_block_inner(
                         value: out.value,
                         script_pubkey: out.script_pubkey.clone(),
                         tweak,
-                        label,
+                        label: label.map(|l| l.into_inner()),
                         block_height,
                         spent_by: None,
                     },
