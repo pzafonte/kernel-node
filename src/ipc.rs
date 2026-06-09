@@ -2,8 +2,8 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use bitcoin::consensus::Decodable;
 use bitcoin::secp256k1::{SecretKey, XOnlyPublicKey};
-use bitcoin::Transaction;
-use wallet::silentpayments::Wallet;
+use bitcoin::{Amount, FeeRate, Transaction};
+use wallet::silentpayments::{SilentPaymentAddress, Wallet};
 
 use crate::{server_capnp, wallet_capnp};
 
@@ -168,6 +168,35 @@ impl wallet_capnp::wallet::Server for WalletIpcInterface {
         self.broadcast_tx
             .try_send(tx)
             .map_err(|e| capnp::Error::failed(format!("broadcast unavailable: {e}")))?;
+        results.get().set_txid(&txid);
+        Ok(())
+    }
+
+    async fn send_to_address(
+        self: capnp::capability::Rc<Self>,
+        params: wallet_capnp::wallet::SendToAddressParams,
+        mut results: wallet_capnp::wallet::SendToAddressResults,
+    ) -> Result<(), capnp::Error> {
+        let p = params.get()?;
+        let address = p.get_address()?.to_string()?;
+        let amount = Amount::from_sat(p.get_amount_sat());
+        let fee_rate = FeeRate::from_sat_per_vb(p.get_fee_rate_sat_per_vb())
+            .ok_or_else(|| capnp::Error::failed("fee rate too large".to_string()))?;
+        let recipient = SilentPaymentAddress::try_from(address.as_str())
+            .map_err(|e| capnp::Error::failed(format!("invalid silent payment address: {e}")))?;
+
+        let mut wallet = self.state.lock().unwrap();
+        let tx = wallet
+            .build_transaction(recipient, amount, fee_rate)
+            .map_err(|e| capnp::Error::failed(format!("could not build transaction: {e}")))?;
+        let outpoints: Vec<_> = tx.input.iter().map(|i| i.previous_output).collect();
+        let txid = tx.compute_txid().to_string();
+        self.broadcast_tx
+            .try_send(tx)
+            .map_err(|e| capnp::Error::failed(format!("broadcast unavailable: {e}")))?;
+        wallet.reserve_coins(outpoints);
+        drop(wallet);
+
         results.get().set_txid(&txid);
         Ok(())
     }
