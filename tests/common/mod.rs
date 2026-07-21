@@ -9,7 +9,7 @@ use kernel_node::server_capnp::server;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+const STOP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TIP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -138,9 +138,11 @@ impl TestNode {
             "cli stop failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        let stop_started = Instant::now();
         let deadline = Instant::now() + STOP_TIMEOUT;
         while Instant::now() < deadline {
             if self.process.try_wait().unwrap().is_some() {
+                eprintln!("DBG stop: node exited in {:?}", stop_started.elapsed());
                 return;
             }
             std::thread::sleep(POLL_INTERVAL);

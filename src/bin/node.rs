@@ -366,8 +366,11 @@ fn run(
                     continue;
                 }
             };
+            info!(target: Category::NODE, "DBG net: connected, stored writer, running={}", running_peer.load(Ordering::SeqCst));
+            let read_started = Instant::now();
             loop {
                 if let Err(e) = peer.receive_and_process_message(&mut node_state) {
+                    info!(target: Category::NODE, "DBG net: read err after {:?}: {}", read_started.elapsed(), e);
                     match e {
                         p2p::net::Error::Io(io) => {
                             if io.kind() != std::io::ErrorKind::UnexpectedEof {
@@ -518,8 +521,9 @@ fn run(
     if let Ok(()) = shutdown_rx.recv() {
         context.interrupt().unwrap();
         let mut peer_lock = kill.lock().unwrap();
-        if let Some(conn) = peer_lock.deref_mut() {
-            conn.shutdown().unwrap()
+        info!(target: Category::NODE, "DBG shutdown: kill.is_some()={}", peer_lock.is_some());
+        if let Some(_conn) = peer_lock.deref_mut() {
+            info!(target: Category::NODE, "DBG shutdown: SKIPPING conn.shutdown() to simulate the reconnect race");
         }
         info!(target: Category::NODE, "Received shutdown signal, shutting down...");
         running.store(false, Ordering::SeqCst);
