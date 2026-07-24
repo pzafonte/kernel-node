@@ -150,6 +150,17 @@ impl TestNode {
         panic!("node did not exit within {STOP_TIMEOUT:?} after stop");
     }
 
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.process.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        false
+    }
+
     fn socket_path(&self) -> PathBuf {
         self.datadir.join("node.sock")
     }
