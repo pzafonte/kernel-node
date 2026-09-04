@@ -18,15 +18,15 @@ use bitcoin::p2p::{
 use bitcoin::secp256k1::rand::random;
 use bitcoin::{hashes::Hash, BlockHash, Network, Transaction};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
-    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
+    prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder, Context, ContextBuilder,
+    Log, Logger, SynchronizationState, ValidationMode,
 };
 use kernel_node::{
     daemonize::Daemonize,
     ext::{ChainExt, DirnameExt, NetworkExt},
     ipc::IpcInterface,
     logging::Category,
-    peer::{NodeState, TipState},
+    peer::NodeState,
     peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
@@ -60,11 +60,9 @@ configure_me::include_config!();
 fn create_context(
     chain_type: ChainType,
     fatal: FatalShutdown,
-    tip_state: &Arc<Mutex<TipState>>,
     wallet: Arc<Mutex<Wallet>>,
     scan_tx: mpsc::Sender<ScanEvent>,
 ) -> Arc<Context> {
-    let tip_state_clone = tip_state.clone();
     let scan_tx_disconnect = scan_tx.clone();
     let fatal_connected = fatal.clone();
     let fatal_disconnected = fatal.clone();
@@ -120,7 +118,6 @@ fn create_context(
                 ValidationMode::Valid => {
                     let hash = bitcoin::BlockHash::from_byte_array(block.hash().into());
                     log::debug!(target: Category::KERNEL, "Validation interface: Successfully checked block: {}", hash);
-                    tip_state_clone.lock().unwrap().block_hash = hash;
                 }
                 _ => error!(target: Category::KERNEL, "Received an invalid block!"),
             }
@@ -526,8 +523,6 @@ fn main() {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let ipc_shutdown = shutdown_tx.clone();
 
-    let tip_state = Arc::new(Mutex::new(TipState::default()));
-
     let network = config.network.parse::<Network>().expect("invalid network");
     let wallet_store = WalletStore::new(
         PathBuf::from(config.datadir.data_dir()).join("wallet.bin"),
@@ -566,7 +561,6 @@ fn main() {
     let context = create_context(
         network.chain_type(),
         fatal.clone(),
-        &tip_state,
         Arc::clone(&wallet),
         scan_tx,
     );
@@ -589,7 +583,6 @@ fn main() {
     let node_state = NodeState {
         addr_tx,
         block_tx,
-        tip_state,
         chainman,
         context: Arc::clone(&context),
     };
@@ -598,10 +591,6 @@ fn main() {
         error!(target: Category::KERNEL, "Error importing blocks: {}", err);
         return;
     }
-
-    let tip_index = node_state.chainman.active_chain().tip();
-    let hash = tip_index.block_hash();
-    node_state.set_tip_state(BlockHash::from_byte_array(hash.to_bytes()));
 
     info!(target: Category::KERNEL, "Bitcoin kernel initialized");
 

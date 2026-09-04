@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     net::SocketAddr,
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc},
 };
 
 use bitcoin::{
@@ -32,36 +32,20 @@ use crate::{
 const PROTOCOL_VERSION: ProtocolVersion = 70015;
 const MAX_LOCATOR_HASHES: usize = 101;
 
-#[derive(Clone)]
-pub struct TipState {
-    pub block_hash: bitcoin::BlockHash,
-}
-
-impl Default for TipState {
-    fn default() -> Self {
-        Self {
-            block_hash: BlockHash::all_zeros(),
-        }
-    }
-}
-
 pub struct NodeState {
     pub addr_tx: mpsc::Sender<Vec<AddrV2Message>>,
     pub block_tx: mpsc::SyncSender<bitcoinkernel::Block>,
-    pub tip_state: Arc<Mutex<TipState>>,
     pub context: Arc<Context>,
     pub chainman: Arc<ChainstateManager>,
 }
 
 impl NodeState {
-    pub fn set_tip_state(&self, block_hash: bitcoin::BlockHash) {
-        let mut state = self.tip_state.lock().unwrap();
-        state.block_hash = block_hash;
-    }
-
-    pub fn get_tip_state(&self) -> TipState {
-        let state = self.tip_state.lock().unwrap();
-        state.clone()
+    pub fn is_on_active_chain(&self, block_hash: &bitcoin::BlockHash) -> bool {
+        let hash = bitcoinkernel::BlockHash::from(block_hash.to_byte_array());
+        match self.chainman.get_block_tree_entry(&hash) {
+            Some(entry) => self.chainman.active_chain().contains(&entry),
+            None => false,
+        }
     }
 }
 
@@ -275,10 +259,16 @@ pub fn process_message(
                     .block_buffer
                     .insert(prev_blockhash, block.convert());
 
-                while let Some(next_block) = block_state
+                while let Some(prev) = block_state
                     .block_buffer
-                    .remove(&node_state.get_tip_state().block_hash)
+                    .keys()
+                    .copied()
+                    .find(|prev| node_state.is_on_active_chain(prev))
                 {
+                    let next_block = block_state
+                        .block_buffer
+                        .remove(&prev)
+                        .expect("hash came from the buffer");
                     if let Err(err) = node_state.block_tx.send(next_block) {
                         debug!(target: Category::NODE, "Encountered error on block send: {}", err);
                         return (PeerStateMachine::AwaitingBlock(block_state), vec![]);
