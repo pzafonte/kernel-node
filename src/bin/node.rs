@@ -4,7 +4,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc, Mutex, Once,
+        Arc, Condvar, Mutex, Once,
     },
     thread::{self, available_parallelism},
     time::{Duration, Instant},
@@ -26,7 +26,7 @@ use kernel_node::{
     ext::{ChainExt, DirnameExt, NetworkExt},
     ipc::IpcInterface,
     logging::Category,
-    peer::NodeState,
+    peer::{DownloadState, NodeState},
     peer_manager::PeerManager,
     resolve_seeds,
     server_capnp::server,
@@ -255,7 +255,6 @@ fn run(
     node_state: NodeState,
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
-    block_rx: mpsc::Receiver<bitcoinkernel::Block>,
     scan_rx: mpsc::Receiver<ScanEvent>,
     broadcast_rx: mpsc::Receiver<Transaction>,
     wallet: Arc<Mutex<Wallet>>,
@@ -353,17 +352,18 @@ fn run(
         info!(target: Category::NODE, "Stopping addr processing thread.");
     });
 
+    let node_state_block = Arc::clone(&node_state);
     let block_processing_handler = thread::spawn(move || {
         info!(target: Category::NODE, "Starting block processing thread.");
         let mut last_block = Instant::now();
         while running_block.load(Ordering::SeqCst) {
-            match block_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(block) => {
+            match node_state_block.wait_for_connectable(Duration::from_secs(1)) {
+                Some(block) => {
                     debug!(target: Category::KERNEL, "Validating block.");
                     last_block = Instant::now();
                     let _ = chainman.process_block(&block);
                 }
-                Err(RecvTimeoutError::Timeout) => {
+                None => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
                         last_block = Instant::now();
                         info!(target: Category::NET, "Potential stale block. Dropping peers to find new ones.");
@@ -373,9 +373,7 @@ fn run(
                             }
                         }
                     }
-                    continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         info!(target: Category::NODE, "Stopping block processing thread.");
@@ -576,15 +574,15 @@ fn main() {
         );
     let chainman = Arc::new(chainman_builder.build().unwrap());
 
-    let (block_tx, block_rx) = mpsc::sync_channel(1);
     let (addr_tx, addr_rx) = mpsc::channel();
     let (broadcast_tx, broadcast_rx) = mpsc::sync_channel::<Transaction>(1);
 
     let node_state = NodeState {
         addr_tx,
-        block_tx,
         chainman,
         context: Arc::clone(&context),
+        download: Mutex::new(DownloadState::default()),
+        connectable: Condvar::new(),
     };
 
     if let Err(err) = node_state.chainman.import_blocks() {
@@ -661,7 +659,6 @@ fn main() {
         node_state,
         shutdown_rx,
         addr_rx,
-        block_rx,
         scan_rx,
         broadcast_rx,
         wallet,
